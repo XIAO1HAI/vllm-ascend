@@ -62,7 +62,7 @@ void swap_blocks_impl(torch::Tensor& src, torch::Tensor& dst,
     char* dst_ptr = static_cast<char*>(dst.data_ptr());
 
     const int64_t block_size_in_bytes = src.element_size() * src.stride(0);
-    
+
     const int64_t num_blocks = block_mapping.size(0);
     const int64_t max_src_block = src.size(0);
     const int64_t max_dst_block = dst.size(0);
@@ -73,7 +73,7 @@ void swap_blocks_impl(torch::Tensor& src, torch::Tensor& dst,
                     "src block index ", src_block_number, " out of range (max: ", max_src_block, ")");
         TORCH_CHECK(dst_block_number >= 0 && dst_block_number <= max_dst_block,
                     "dst block index ", dst_block_number, " out of range (max: ", max_dst_block, ")");
-        
+
         int64_t src_offset = src_block_number * block_size_in_bytes;
         int64_t dst_offset = dst_block_number * block_size_in_bytes;
 
@@ -84,13 +84,13 @@ void swap_blocks_impl(torch::Tensor& src, torch::Tensor& dst,
 }
 
 void swap_blocks(torch::Tensor &x, torch::Tensor &y, const torch::Tensor &z)
-{    
-  
+{
+
     const c10_npu::OptionalNPUGuard npuGuard(
         (!x.device().is_cpu()) ? x.device() : y.device()
     );
-    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();                       
-    swap_blocks_impl(x, y, z, stream);           
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    swap_blocks_impl(x, y, z, stream);
     return;
 }
 
@@ -233,7 +233,7 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
         enable_inner_out.has_value()
             ? enable_inner_out.value()
             : false;
-    
+
     auto [workspace_tensor, tiling, block_dim] = mlapo::mla_preprocess_tiling(
         hiddenState,
         wdqkv,
@@ -959,7 +959,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> dispatch_prefill(
 
     EXEC_NPU_CMD(aclnnNotifyDispatch,
         send_data,
-        num_tokens_per_expert, 
+        num_tokens_per_expert,
         send_count,
         num_tokens,
         group_ep_ptr,  // commGroup
@@ -1140,15 +1140,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_moe_init_routing_
     }
 
     int64_t x_dim = x.dim();
-    TORCH_CHECK(x_dim == DIM_X, "The x should be ", DIM_X, 
+    TORCH_CHECK(x_dim == DIM_X, "The x should be ", DIM_X,
                 "-Dimension, current is ", x_dim, "-Dimension.");
 
     int64_t expert_idx_dim = expert_idx.dim();
-    TORCH_CHECK(expert_idx_dim == DIM_EXPERT_IDX, "The expert_idx should be ", DIM_EXPERT_IDX, 
+    TORCH_CHECK(expert_idx_dim == DIM_EXPERT_IDX, "The expert_idx should be ", DIM_EXPERT_IDX,
                 "-Dimension, current is ", expert_idx_dim, "-Dimension.");
 
     int64_t active_expert_range_length = active_expert_range.size();
-    TORCH_CHECK(active_expert_range_length == LENGTH_ACTIVE_EXPERT_RANGE, "The active_expert_range should be ", LENGTH_ACTIVE_EXPERT_RANGE, 
+    TORCH_CHECK(active_expert_range_length == LENGTH_ACTIVE_EXPERT_RANGE, "The active_expert_range should be ", LENGTH_ACTIVE_EXPERT_RANGE,
                 "-Dimension, current is ", expert_idx_dim, "-Dimension.");
 
     int expert_length = active_expert_range[1] - active_expert_range[0];
@@ -1218,6 +1218,33 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_moe_init_routing_
     return std::tie(expanded_x, expanded_row_idx, expert_tokens_count_or_cumsum, expanded_scale);
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_quant(const at::Tensor &x1, const at::Tensor &x2, at::Tensor &gamma,
+                                                                const at::Tensor &scales1, const c10::optional<at::Tensor> &zero_points1,
+                                                                const c10::optional<at::Tensor> &beta, const c10::optional<at::Tensor> &scales2,
+                                                                const c10::optional<at::Tensor> &zero_points2, int64_t axis, double epsilon, bool div_mode)
+{
+    TORCH_BIND_ASSERT(axis == -1);
+    TORCH_BIND_ASSERT(div_mode == true);
+
+    int num_blocks = x1.size(0);
+    const int hidden_size = x1.size(1);
+
+    auto output_dtype_0 = at::kChar;
+    auto output_dtype_1 = x1.scalar_type();
+    auto device = x1.device();
+
+    // at::Tensor y1 = at::empty({num_tokens, hidden_size}, at::dtype(at::kChar).device(device));
+    // at::Tensor y2 = at::empty({num_tokens, hidden_size}, at::dtype(at::kChar).device(device));
+    // at::Tensor x_out = at::empty({num_tokens, hidden_size}, at::dtype(output_dtype_1).device(device));
+
+    at::Tensor y1 = at::empty_like(x1).to(at::kChar);
+    at::Tensor y2 = at::empty_like(x1).to(at::kChar);
+    at::Tensor x_out = at::empty_like(x1);
+
+    EXEC_NPU_CMD(aclnnAddRmsNormQuant, x1, x2, gamma, scales1, scales2, zero_points1, zero_points2, axis, epsilon, div_mode, y1, y2, x_out);
+    return std::make_tuple(y1, y2, x_out);
+}
+
 } // namespace vllm_ascend
 
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
@@ -1274,10 +1301,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     //batch_matmul ops refer to sgl-kernel-npu
     ops.def(
-            "batch_matmul_transpose(Tensor tensor_a, Tensor tensor_b, Tensor tensor_c, str? format_mode=None, str? quant_mode=None) -> ()");    
+            "batch_matmul_transpose(Tensor tensor_a, Tensor tensor_b, Tensor tensor_c, str? format_mode=None, str? quant_mode=None) -> ()");
     ops.impl("batch_matmul_transpose", torch::kPrivateUse1, &vllm_ascend::batch_matmul_transpose);
 
-    ops.def("swap_blocks(Tensor! x, Tensor! y, Tensor z) -> ()");    
+    ops.def("swap_blocks(Tensor! x, Tensor! y, Tensor z) -> ()");
     ops.impl("swap_blocks", torch::kPrivateUse1, &vllm_ascend::swap_blocks);
 
     ops.def(
@@ -1364,4 +1391,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                            int row_idx_type=0) -> (Tensor, Tensor, Tensor, Tensor)"
     );
     ops.impl("npu_moe_init_routing_custom", torch::kPrivateUse1, &vllm_ascend::npu_moe_init_routing_custom);
+
+    ops.def("add_rms_norm_quant(Tensor x1, Tensor x2, Tensor gamma,"
+            "Tensor scales1, Tensor? zero_points1=None,"
+            "Tensor? beta=None, Tensor? scales2=None,"
+            "Tensor? zero_points2=None, int axis=-1, float epsilon=1e-06,"
+            "bool div_mode=True) -> (Tensor, Tensor, Tensor)"
+        );
+    ops.impl("add_rms_norm_quant", torch::kPrivateUse1, &vllm_ascend::add_rms_norm_quant);
 }
