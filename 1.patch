@@ -1,0 +1,276 @@
+diff --git a/csrc/build_aclnn.sh b/csrc/build_aclnn.sh
+index 90540088..f516de05 100644
+--- a/csrc/build_aclnn.sh
++++ b/csrc/build_aclnn.sh
+@@ -24,7 +24,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
+     ABSOLUTE_CATLASS_PATH=$(cd "${CATLASS_PATH}" && pwd)
+     export CPATH=${ABSOLUTE_CATLASS_PATH}:${CPATH}
+ 
+-    CUSTOM_OPS="grouped_matmul_swiglu_quant_weight_nz_tensor_list;lightning_indexer;sparse_flash_attention;matmul_allreduce_add_rmsnorm"
++    CUSTOM_OPS="grouped_matmul_swiglu_quant_weight_nz_tensor_list;lightning_indexer;sparse_flash_attention;add_rms_norm_quant"
+     SOC_ARG="ascend910b"
+ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
+     # ASCEND910C (A3) series
+@@ -69,6 +69,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
+         "moe_dispatch_normal"
+         "dispatch_layout"
+         "notify_dispatch"
++	"add_rms_norm_quant"
+     )
+     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
+     SOC_ARG="ascend910_93"
+diff --git a/csrc/torch_binding.cpp b/csrc/torch_binding.cpp
+index e0c976c4..7b839aed 100644
+--- a/csrc/torch_binding.cpp
++++ b/csrc/torch_binding.cpp
+@@ -1116,6 +1116,33 @@ at::Tensor combine_prefill(const at::Tensor& x, const at::Tensor& topk_idx, cons
+     return combined_x;
+ }
+ 
++std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_quant(const at::Tensor &x1, const at::Tensor &x2, const at::Tensor &gamma,
++                                   const at::Tensor &scales1, const c10::optional<at::Tensor> &zero_points1,
++                                   const c10::optional<at::Tensor> &beta, const c10::optional<at::Tensor> &scales2,
++                                   const c10::optional<at::Tensor> &zero_points2, int64_t axis, double epsilon, bool div_mode)
++{
++    TORCH_BIND_ASSERT(axis == -1);
++    TORCH_BIND_ASSERT(div_mode == true);
++
++    int num_tokens = x1.size(0);
++    const int hidden_size = x1.size(1);
++
++    auto output_dtype_0 = at::kChar;
++    auto output_dtype_1 = x1.scalar_type();
++    auto device = x1.device();
++
++    /**
++    at::Tensor y1 = at::empty({num_tokens, hidden_size}, at::dtype(at::kChar).device(device));
++    at::Tensor y2 = at::empty({num_tokens, hidden_size}, at::dtype(at::kChar).device(device));
++    at::Tensor x_out = at::empty({num_tokens, hidden_size}, at::dtype(output_dtype_1).device(device));
++    **/
++    at::Tensor y1 = at::empty_like(x1).to(at::kChar);
++    at::Tensor y2 = at::empty_like(x1).to(at::kChar);
++    at::Tensor x_out = at::empty_like(x1);
++
++    EXEC_NPU_CMD(aclnnAddRmsNormQuant, x1, x2, gamma, scales1, scales2, zero_points1, zero_points2, axis, epsilon, div_mode, y1, y2, x_out);
++    return std::make_tuple(y1, y2, x_out);
++}
+ } // namespace vllm_ascend
+ 
+ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+@@ -1254,4 +1281,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+             "num_ranks) -> Tensor");
+     ops.impl("combine_prefill", torch::kPrivateUse1,
+              &vllm_ascend::combine_prefill);
++
++    ops.def("add_rms_norm_quant(Tensor x1, Tensor x2, Tensor gamma,"
++             "Tensor scales1, Tensor? zero_points1=None,"
++             "Tensor? beta=None, Tensor? scales2=None,"
++             "Tensor? zero_points2=None, int axis=-1, float epsilon=1e-06,"
++             "bool div_mode=True) -> (Tensor, Tensor, Tensor)"
++    );
++    ops.impl("add_rms_norm_quant", torch::kPrivateUse1, &vllm_ascend::add_rms_norm_quant);
+ }
+diff --git a/csrc/torch_binding_meta.cpp b/csrc/torch_binding_meta.cpp
+index 3223801b..b17b080f 100644
+--- a/csrc/torch_binding_meta.cpp
++++ b/csrc/torch_binding_meta.cpp
+@@ -244,6 +244,31 @@ at::Tensor npu_lightning_indexer_meta(
+     at::Tensor lightning_indexer_output = at::empty(output_size, query.options().dtype(at::kInt));
+     return lightning_indexer_output;
+ }
++std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_quant_meta(const at::Tensor &x1, const at::Tensor &x2, const at::Tensor &gamma,
++                                   const at::Tensor &scales1, const c10::optional<at::Tensor> &zero_points1,
++                                   const c10::optional<at::Tensor> &beta, const c10::optional<at::Tensor> &scales2,
++                                   const c10::optional<at::Tensor> &zero_points2, int64_t axis, double epsilon, bool div_mode)
++{
++    TORCH_BIND_ASSERT(axis == -1);
++    TORCH_BIND_ASSERT(div_mode == true);
++
++    int num_tokens = x1.size(0);
++    const int hidden_size = x1.size(1);
++
++    auto output_dtype_0 = at::kChar;
++    auto output_dtype_1 = x1.scalar_type();
++    auto device = x1.device();
++
++    /**
++    at::Tensor y1 = at::empty({num_tokens, hidden_size}, at::dtype(at::kChar).device(device));
++    at::Tensor y2 = at::empty({num_tokens, hidden_size}, at::dtype(at::kChar).device(device));
++    at::Tensor x_out = at::empty({num_tokens, hidden_size}, at::dtype(output_dtype_1).device(device));
++    **/
++    at::Tensor y1 = at::empty_like(x1).to(at::kChar);
++    at::Tensor y2 = at::empty_like(x1).to(at::kChar);
++    at::Tensor x_out = at::empty_like(x1);
++    return std::make_tuple(y1, y2, x_out);
++}
+ 
+ at::Tensor npu_sparse_flash_attention_meta(
+     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
+@@ -315,5 +340,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
+     // matmul allreduce add rmsnorm
+     ops.impl("matmul_allreduce_add_rmsnorm", &vllm_ascend::meta::matmul_allreduce_add_rmsnorm_meta);
++    // add rms norm quant
++    ops.impl("add_rms_norm_quant", &vllm_ascend::meta::add_rms_norm_quant_meta);
+ }
+ }
+diff --git a/vllm_ascend/ascend_forward_context.py b/vllm_ascend/ascend_forward_context.py
+index 22233bc9..3c665949 100644
+--- a/vllm_ascend/ascend_forward_context.py
++++ b/vllm_ascend/ascend_forward_context.py
+@@ -138,6 +138,19 @@ def set_ascend_forward_context(
+         else:
+             max_tokens_across_dp = num_tokens
+ 
++        from vllm_ascend.quantization.quant_config import AscendQuantConfig
++        model_type_scope = ["llama", "qwen2", "qwen3", "qwen3_moe"]
++        addrmsnorm_quant_fusion_enabled = isinstance(vllm_config.quant_config, AscendQuantConfig) and \
++            vllm_config.model_config.hf_config.model_type in model_type_scope and \
++            forward_context.layer_idx is not None
++        if addrmsnorm_quant_fusion_enabled:
++            forward_context.model_instance = model_instance
++            forward_context.num_hidden_layers = vllm_config.model_config.hf_config.num_hidden_layers
++            forward_context.fusion_linear = "gate_up_dense" if forward_context.layer_idx == 0 else "qkv_dense"
++            if vllm_config.model_config.hf_config.model_type == "qwen3_moe":
++                forward_context.fusion_linear = "gate_moe" if forward_context.layer_idx == 0 else "qkv_moe"
++        forward_context.addrmsnorm_quant_fusion_enabled = addrmsnorm_quant_fusion_enabled
++
+         forward_context.max_tokens_across_dp = max_tokens_across_dp
+ 
+         if num_tokens is not None:
+diff --git a/vllm_ascend/ops/layernorm.py b/vllm_ascend/ops/layernorm.py
+index cdbba32f..4cd3c7dd 100644
+--- a/vllm_ascend/ops/layernorm.py
++++ b/vllm_ascend/ops/layernorm.py
+@@ -20,7 +20,63 @@ from typing import Optional, Tuple, Union, cast
+ import torch
+ from vllm.config import get_current_vllm_config
+ from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
+-
++from vllm.forward_context import get_forward_context
++
++
++def _addrmsnorm_forward_oot(
++    self,
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    layer: Optional[torch.nn.Module] = None,
++    bias: Optional[torch.nn.Parameter] = None,
++) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
++    import torch_npu
++
++    from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
++
++    if layer is not None and get_ascend_device_type(
++    ) != AscendDeviceType._310P:
++        layer_cls_name = layer.__class__.__name__
++        weight_prefetch_method = None
++
++        # prefetch qkvo_proj.weight preprocess
++        if weight_prefetch_method:
++            weight_prefetch_method.maybe_prefetch_attn_weight_preprocess(
++                layer_cls_name=layer_cls_name,
++                weight=layer.weight,
++                start_flag=x,
++            )
++        # add_rms_norm_quant
++        x, _, residual = torch.ops._C_ascend.add_rms_norm_quant(
++            x,
++            residual,
++            self.weight,
++            layer.aclnn_input_scale,
++            layer.aclnn_input_offset,
++            beta=bias,
++            epsilon=self.variance_epsilon)
++
++        # prefetch qkvo_proj.weight postprocess
++        if weight_prefetch_method:
++            weight_prefetch_method.maybe_prefetch_attn_weight_postprocess(
++                layer_cls_name=layer_cls_name,
++                stop_flag=x,
++            )
++
++    else:
++        if get_ascend_device_type() == AscendDeviceType._310P:
++            orig_dtype = residual.dtype
++            x = x + residual.to(x.dtype)
++            residual = x.to(orig_dtype)
++            x, _ = torch_npu.npu_rms_norm(x, self.weight,
++                                          self.variance_epsilon)
++        else:
++            x, _, residual = torch_npu.npu_add_rms_norm(
++                x, residual, self.weight, self.variance_epsilon)
++        if bias is not None:
++            x.add_(bias)
++    torch.ops.vllm.maybe_wait_prefetch_done(x)
++    return x, residual
+ 
+ class AscendRMSNorm(RMSNorm):
+ 
+@@ -50,6 +106,12 @@ class AscendRMSNorm(RMSNorm):
+ 
+         from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+         if residual is not None:
++            residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
++            assert x.size(0) == residual.size(0)
++            x, residual = _addrmsnorm_forward_oot(
++                self, x, residual, self.next_need_quant_fusion_linear(),
++                self.bias)
++            '''
+             if get_ascend_device_type() == AscendDeviceType._310P:
+                 orig_dtype = residual.dtype
+                 x = x + residual.to(x.dtype)
+@@ -61,6 +123,7 @@ class AscendRMSNorm(RMSNorm):
+                     x, residual, self.weight, self.variance_epsilon)
+                 if self.bias is not None:
+                     x.add_(self.bias)
++            '''
+             return x, residual
+ 
+         x, residual = torch_npu.npu_rms_norm(x, self.weight,
+@@ -69,6 +132,45 @@ class AscendRMSNorm(RMSNorm):
+             x.add_(self.bias)
+         return x
+ 
++    def next_need_quant_fusion_linear(self):
++        try:
++            forward_context = get_forward_context()
++            if not forward_context.addrmsnorm_quant_fusion_enabled or \
++                forward_context.layer_idx == forward_context.num_hidden_layers:
++                return None
++        except AssertionError:
++            return None
++
++        next_linear = None
++        model_instance = forward_context.model_instance
++        layer_idx = forward_context.layer_idx
++        fusion_linear = forward_context.fusion_linear
++        next_linear = None
++        if fusion_linear == "qkv_dense":
++            next_linear = model_instance.model.layers[
++                layer_idx].self_attn.qkv_proj
++            forward_context.fusion_linear = "gate_up_dense"
++        elif fusion_linear == "gate_up_dense":
++            next_linear = model_instance.model.layers[
++                layer_idx].mlp.gate_up_proj
++            forward_context.fusion_linear = "qkv_dense"
++            # if prefetch_mlp_weight enabled, following accumulation operation
++            # does not need to be repeated
++            if not forward_context.prefetch_mlp_enabled:
++                forward_context.layer_idx += 1
++        elif fusion_linear == "qkv_moe":
++            next_linear = model_instance.model.layers[
++                layer_idx].self_attn.qkv_proj
++            forward_context.fusion_linear = "gate_moe"
++        elif fusion_linear == "gate_moe":
++            forward_context.fusion_linear = "qkv_moe"
++            forward_context.layer_idx += 1
++        from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
++        if next_linear is not None and \
++            not isinstance(next_linear.quant_method.quant_method, AscendW8A8LinearMethod):
++            next_linear = None
++        return next_linear
++
+ 
+ class AscendQuantRMSNorm(AscendRMSNorm):
+ 
